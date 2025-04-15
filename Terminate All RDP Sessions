@@ -1,0 +1,7 @@
+$rdpSessions = Get-Process -Name "mstsc"
+
+foreach ($session in $rdpSessions) {
+    Stop-Process -Id $session.Id -Force
+}
+
+Write-Output "All RDP sessions have been terminated"
