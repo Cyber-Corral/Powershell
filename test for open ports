@@ -1,0 +1,1 @@
+Test-NetConnection -ComputerName "abcd" -Port 22
