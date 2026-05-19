@@ -1,0 +1,51 @@
+function SCCMPurgeList {
+
+    $MaxRetention = 60
+
+    $SCCMClient = New-Object -ComObject UIResource.UIResourceMgr
+
+    if ($SCCMClient -ne $null) {
+        if ($SCCMClient.GetType().Name -match "_ComObject") {
+
+            $CacheInfo = $SCCMClient.GetCacheInfo()
+            $SCCMCacheDir = $CacheInfo.Location
+
+            # Get pending/running apps
+            $PendingApps = $SCCMClient.GetAvailableApplications() | Where-Object {
+                ($_.StartTime -gt (Get-Date)) -or ($_.IsCurrentlyRunning -eq "1")
+            }
+
+            $PendingIDs = $PendingApps | Select-Object -ExpandProperty PackageID
+
+            # Find purge candidates
+            $PurgeApps = $CacheInfo.GetCacheElements() | Where-Object {
+                ($_.ContentID -notin $PendingIDs) -and
+                (Test-Path $_.Location) -and
+                ($_.LastReferenceTime -lt (Get-Date).AddDays(-$MaxRetention)) -and
+                ($_.ReferenceCount -eq 0)
+            }
+
+            # Delete via SCCM API
+            foreach ($App in $PurgeApps) {
+                try {
+                    $CacheInfo.DeleteCacheElement($App.CacheElementID)
+                    Write-Output "Deleted: $($App.ContentID)"
+                }
+                catch {
+                    Write-Output "Skipped (in use): $($App.ContentID)"
+                }
+            }
+
+            # Clean orphan folders ONLY
+            $ActiveDirs = $CacheInfo.GetCacheElements() | ForEach-Object { $_.Location }
+
+            Get-ChildItem -Path $SCCMCacheDir -Directory | Where-Object {
+                $_.FullName -notin $ActiveDirs
+            } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue -Verbose
+
+        }
+    }
+}
+
+# Run it
+SCCMPurgeList
