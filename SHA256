@@ -1,0 +1,1 @@
+Get-FileHash "C:\Users\XXXXX\Downloads\XXXXX.msi" -Algorithm SHA256
