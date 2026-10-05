@@ -1,0 +1,5 @@
+$result = Invoke-WmiMethod -Namespace root\ccm\ClientSDK `
+    -Class CCM_ClientUtilities `
+    -Name DetermineIfRebootPending
+
+$result.RebootPending
