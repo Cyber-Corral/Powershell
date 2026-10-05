@@ -3,3 +3,16 @@ $result = Invoke-WmiMethod -Namespace root\ccm\ClientSDK `
     -Name DetermineIfRebootPending
 
 $result.RebootPending
+
+
+
+------------------------------------------------------------------------
+
+
+$CBS = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending"
+$WU  = Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired"
+
+[PSCustomObject]@{
+    CBSRebootPending = $CBS
+    WURebootPending  = $WU
+}
