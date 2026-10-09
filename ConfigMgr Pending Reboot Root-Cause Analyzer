@@ -1,0 +1,980 @@
+<#
+.SYNOPSIS
+    ConfigMgr Pending Reboot Root-Cause Analyzer
+
+.DESCRIPTION
+    Read-only troubleshooting script that determines why a Windows server
+    is reporting a pending reboot.
+
+    Checks:
+      - ConfigMgr Client SDK reboot status
+      - Windows Update RebootRequired
+      - CBS RebootPending
+      - PendingFileRenameOperations
+      - Server Manager CurrentRebootAttempts
+      - Last boot time
+      - Windows shutdown/restart events
+      - ConfigMgr client logs
+      - Recent hotfixes
+      - Likely root-cause classification
+
+    Logs reviewed:
+      - RebootCoordinator.log
+      - UpdatesDeployment.log
+      - UpdatesHandler.log
+      - WUAHandler.log
+      - ScanAgent.log
+      - ServiceWindowManager.log
+
+.NOTES
+    Runs on Windows PowerShell 5.1.
+    Run as Administrator or SYSTEM.
+    Makes no system changes and does not initiate a reboot.
+#>
+
+[CmdletBinding()]
+param(
+    [int]$LogTailLines = 3000,
+    [int]$MaximumLogMatches = 20,
+    [int]$EventLookbackDays = 45,
+    [switch]$IncludeDetailedLogMatches,
+    [switch]$OutputJson
+)
+
+$ErrorActionPreference = 'SilentlyContinue'
+
+# ---------------------------------------------------------------------------
+# Functions
+# ---------------------------------------------------------------------------
+
+function Convert-ConfigMgrLogLine {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Line,
+
+        [Parameter(Mandatory)]
+        [string]$LogName
+    )
+
+    $message = $Line
+    $time = $null
+    $date = $null
+    $component = $null
+
+    if ($Line -match '<!\[LOG\[(.*?)\]LOG\]!>') {
+        $message = $matches[1]
+    }
+
+    if ($Line -match 'time="([^"]+)"') {
+        $time = $matches[1]
+    }
+
+    if ($Line -match 'date="([^"]+)"') {
+        $date = $matches[1]
+    }
+
+    if ($Line -match 'component="([^"]+)"') {
+        $component = $matches[1]
+    }
+
+    [PSCustomObject]@{
+        Log       = $LogName
+        Date      = $date
+        Time      = $time
+        Component = $component
+        Message   = $message.Trim()
+        RawLine   = $Line
+    }
+}
+
+function Get-ConfigMgrLogMatches {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LogName,
+
+        [Parameter(Mandatory)]
+        [string[]]$Patterns,
+
+        [int]$TailLines = 3000,
+
+        [int]$MaximumMatches = 20
+    )
+
+    $path = Join-Path $script:CCMLogPath $LogName
+
+    if (-not (Test-Path -LiteralPath $path)) {
+        return @()
+    }
+
+    $lines = Get-Content -LiteralPath $path -Tail $TailLines -ErrorAction SilentlyContinue
+    $results = New-Object System.Collections.Generic.List[object]
+
+    foreach ($line in $lines) {
+        foreach ($pattern in $Patterns) {
+            if ($line -match $pattern) {
+                $results.Add((Convert-ConfigMgrLogLine -Line $line -LogName $LogName))
+                break
+            }
+        }
+    }
+
+    @($results | Select-Object -Last $MaximumMatches)
+}
+
+function Test-RegistryPath {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    Test-Path -LiteralPath $Path
+}
+
+function Get-PendingFileRenameData {
+    $path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager'
+
+    try {
+        $value = Get-ItemProperty `
+            -LiteralPath $path `
+            -Name PendingFileRenameOperations `
+            -ErrorAction Stop
+
+        $operations = @($value.PendingFileRenameOperations)
+
+        [PSCustomObject]@{
+            Present    = ($operations.Count -gt 0)
+            EntryCount = $operations.Count
+            Entries    = $operations
+        }
+    }
+    catch {
+        [PSCustomObject]@{
+            Present    = $false
+            EntryCount = 0
+            Entries    = @()
+        }
+    }
+}
+
+function Get-ConfigMgrRebootState {
+    try {
+        $result = Invoke-CimMethod `
+            -Namespace 'ROOT\ccm\ClientSDK' `
+            -ClassName 'CCM_ClientUtilities' `
+            -MethodName 'DetermineIfRebootPending' `
+            -ErrorAction Stop
+
+        [PSCustomObject]@{
+            QuerySucceeded      = $true
+            ReturnValue         = $result.ReturnValue
+            RebootPending       = [bool]$result.RebootPending
+            IsHardRebootPending = [bool]$result.IsHardRebootPending
+            InGracePeriod       = [bool]$result.InGracePeriod
+            RebootDeadline      = $result.RebootDeadline
+            DisableHideTime     = $result.DisableHideTime
+            Error               = $null
+        }
+    }
+    catch {
+        [PSCustomObject]@{
+            QuerySucceeded      = $false
+            ReturnValue         = $null
+            RebootPending       = $false
+            IsHardRebootPending = $false
+            InGracePeriod       = $false
+            RebootDeadline      = $null
+            DisableHideTime     = $null
+            Error               = $_.Exception.Message
+        }
+    }
+}
+
+function Get-RebootEvents {
+    param(
+        [int]$LookbackDays = 45
+    )
+
+    $startTime = (Get-Date).AddDays(-$LookbackDays)
+
+    try {
+        @(
+            Get-WinEvent -FilterHashtable @{
+                LogName   = 'System'
+                Id        = 1074, 6005, 6006, 6008, 41
+                StartTime = $startTime
+            } -ErrorAction Stop |
+            Sort-Object TimeCreated -Descending |
+            Select-Object -First 30 @{
+                Name       = 'TimeCreated'
+                Expression = { $_.TimeCreated }
+            }, @{
+                Name       = 'EventID'
+                Expression = { $_.Id }
+            }, @{
+                Name       = 'Meaning'
+                Expression = {
+                    switch ($_.Id) {
+                        1074 { 'Planned shutdown or restart initiated' }
+                        6005 { 'Event Log service started; system startup evidence' }
+                        6006 { 'Event Log service stopped; orderly shutdown evidence' }
+                        6008 { 'Previous shutdown was unexpected' }
+                        41   { 'System restarted without a clean shutdown' }
+                        default { 'Other' }
+                    }
+                }
+            }, @{
+                Name       = 'Message'
+                Expression = {
+                    if ($_.Message) {
+                        ($_.Message -replace '\s+', ' ').Trim()
+                    }
+                }
+            }
+        )
+    }
+    catch {
+        @()
+    }
+}
+
+function Get-LatestSuccessfulInstallTime {
+    param(
+        [object[]]$WuaMatches,
+        [object[]]$HandlerMatches
+    )
+
+    $candidateLines = @($WuaMatches) + @($HandlerMatches)
+
+    $successful = $candidateLines |
+        Where-Object {
+            $_.Message -match 'finished installing.*0x00000000' -or
+            $_.Message -match 'installation.*completed.*success' -or
+            $_.Message -match 'install.*successful'
+        } |
+        Select-Object -Last 1
+
+    if ($successful) {
+        return "$($successful.Date) $($successful.Time)"
+    }
+
+    return $null
+}
+
+function Add-Reason {
+    param(
+        [System.Collections.Generic.List[string]]$List,
+        [string]$Reason
+    )
+
+    if ($Reason -and -not $List.Contains($Reason)) {
+        $List.Add($Reason)
+    }
+}
+
+function Get-RootCauseClassification {
+    param(
+        [object]$Data
+    )
+
+    $reasons = New-Object System.Collections.Generic.List[string]
+    $classification = 'No pending reboot detected'
+    $confidence = 'High'
+    $recommendedAction = 'No reboot remediation is currently indicated.'
+
+    $pendingIndicators = @(
+        $Data.ConfigMgr.RebootPending,
+        $Data.ConfigMgr.IsHardRebootPending,
+        $Data.Registry.WindowsUpdateRebootRequired,
+        $Data.Registry.CBSRebootPending,
+        $Data.Registry.PendingFileRenameOperations,
+        $Data.Registry.ServerManagerRebootAttempts
+    ) -contains $true
+
+    if (-not $pendingIndicators) {
+        return [PSCustomObject]@{
+            Classification    = $classification
+            Confidence        = $confidence
+            Reasons           = @()
+            RecommendedAction = $recommendedAction
+        }
+    }
+
+    # Gather direct indicators.
+    if ($Data.ConfigMgr.RebootPending) {
+        Add-Reason -List $reasons -Reason 'ConfigMgr Client SDK reports RebootPending=True.'
+    }
+
+    if ($Data.ConfigMgr.IsHardRebootPending) {
+        Add-Reason -List $reasons -Reason 'ConfigMgr Client SDK reports IsHardRebootPending=True.'
+    }
+
+    if ($Data.Registry.WindowsUpdateRebootRequired) {
+        Add-Reason -List $reasons -Reason 'Windows Update RebootRequired registry key is present.'
+    }
+
+    if ($Data.Registry.CBSRebootPending) {
+        Add-Reason -List $reasons -Reason 'Component Based Servicing RebootPending registry key is present.'
+    }
+
+    if ($Data.Registry.PendingFileRenameOperations) {
+        Add-Reason -List $reasons -Reason "PendingFileRenameOperations contains $($Data.Registry.PendingFileRenameCount) entries."
+    }
+
+    if ($Data.Registry.ServerManagerRebootAttempts) {
+        Add-Reason -List $reasons -Reason 'Server Manager CurrentRebootAttempts is present.'
+    }
+
+    if ($Data.Evidence.UpdateInstalledSuccessfully) {
+        Add-Reason -List $reasons -Reason 'ConfigMgr logs show a successful update installation.'
+    }
+
+    if ($Data.Evidence.UpdateRequestedReboot) {
+        Add-Reason -List $reasons -Reason 'ConfigMgr logs show that the update required a reboot.'
+    }
+
+    if ($Data.Evidence.ConfigMgrScheduledReboot) {
+        Add-Reason -List $reasons -Reason 'RebootCoordinator.log shows that ConfigMgr scheduled a reboot.'
+    }
+
+    if ($Data.Evidence.MaintenanceWindowIssue) {
+        Add-Reason -List $reasons -Reason 'ConfigMgr logs contain maintenance-window or insufficient-window evidence.'
+    }
+
+    if ($Data.Evidence.UpdateFailure) {
+        Add-Reason -List $reasons -Reason 'ConfigMgr logs contain update installation, scan, or handler failure evidence.'
+    }
+
+    if ($Data.Evidence.ScanFailure) {
+        Add-Reason -List $reasons -Reason 'ConfigMgr logs contain software-update scan failure evidence.'
+    }
+
+    if ($Data.Evidence.RestartInitiated) {
+        Add-Reason -List $reasons -Reason 'Available evidence indicates that a restart was initiated.'
+    }
+
+    if ($Data.Evidence.RestartAfterLatestInstall) {
+        Add-Reason -List $reasons -Reason 'Windows event history contains restart or startup evidence after the latest detected installation.'
+    }
+
+    # Classification order matters. Specific system indicators beat generic ones.
+    if ($Data.Registry.CBSRebootPending -and $Data.Evidence.RestartAfterLatestInstall) {
+        $classification = 'CBS servicing remains pending after a reboot'
+        $confidence = 'High'
+        $recommendedAction = 'Review CBS.log and DISM servicing health before scheduling another reboot.'
+    }
+    elseif ($Data.Registry.PendingFileRenameOperations -and $Data.Evidence.RestartAfterLatestInstall) {
+        $classification = 'Pending file rename remains after a reboot'
+        $confidence = 'High'
+        $recommendedAction = 'Review the pending file rename entries to identify the application, driver, or installer that created them.'
+    }
+    elseif ($Data.Evidence.UpdateInstalledSuccessfully -and
+            $Data.Evidence.UpdateRequestedReboot -and
+            -not $Data.Evidence.RestartAfterLatestInstall) {
+        $classification = 'Updates installed successfully, but the required reboot did not complete'
+        $confidence = 'High'
+        $recommendedAction = 'Schedule the server for an approved reboot and validate the pending-reboot state afterward.'
+    }
+    elseif ($Data.Evidence.ConfigMgrScheduledReboot -and
+            -not $Data.Evidence.RestartAfterLatestInstall) {
+        $classification = 'ConfigMgr scheduled a reboot, but no completed reboot was detected'
+        $confidence = 'High'
+        $recommendedAction = 'Review RebootCoordinator.log, maintenance-window timing, and Windows Event ID 1074 evidence.'
+    }
+    elseif ($Data.Evidence.MaintenanceWindowIssue) {
+        $classification = 'Maintenance-window timing likely prevented installation or restart completion'
+        $confidence = 'Medium'
+        $recommendedAction = 'Review ServiceWindowManager.log and compare installation and restart deadlines with the applicable maintenance window.'
+    }
+    elseif ($Data.Evidence.UpdateFailure) {
+        $classification = 'Software-update installation or enforcement failure'
+        $confidence = 'Medium'
+        $recommendedAction = 'Investigate the reported HRESULT values in UpdatesHandler.log, WUAHandler.log, and UpdatesDeployment.log.'
+    }
+    elseif ($Data.Evidence.ScanFailure) {
+        $classification = 'Software-update scan failure'
+        $confidence = 'Medium'
+        $recommendedAction = 'Investigate ScanAgent.log and WUAHandler.log before attempting additional patch enforcement.'
+    }
+    elseif ($Data.Registry.WindowsUpdateRebootRequired) {
+        $classification = 'Windows Update is awaiting a reboot'
+        $confidence = 'High'
+        $recommendedAction = 'Schedule an approved reboot and rerun this script after the server returns.'
+    }
+    elseif ($Data.Registry.CBSRebootPending) {
+        $classification = 'Windows component servicing is awaiting a reboot'
+        $confidence = 'High'
+        $recommendedAction = 'Schedule an approved reboot. If the condition remains afterward, investigate CBS and DISM health.'
+    }
+    elseif ($Data.Registry.PendingFileRenameOperations) {
+        $classification = 'An application, installer, or driver has pending file operations'
+        $confidence = 'High'
+        $recommendedAction = 'Review the pending file rename entries and coordinate an approved reboot.'
+    }
+    elseif ($Data.ConfigMgr.IsHardRebootPending) {
+        $classification = 'ConfigMgr reports a hard reboot requirement'
+        $confidence = 'High'
+        $recommendedAction = 'Schedule an approved reboot and validate ConfigMgr state afterward.'
+    }
+    elseif ($Data.ConfigMgr.RebootPending) {
+        $classification = 'ConfigMgr reports pending reboot without a more specific local indicator'
+        $confidence = 'Medium'
+        $recommendedAction = 'Review RebootCoordinator.log and update deployment history, then schedule an approved reboot if appropriate.'
+    }
+    else {
+        $classification = 'Pending reboot source could not be conclusively identified'
+        $confidence = 'Low'
+        $recommendedAction = 'Review the detailed log matches and Windows servicing logs.'
+    }
+
+    [PSCustomObject]@{
+        Classification    = $classification
+        Confidence        = $confidence
+        Reasons           = @($reasons)
+        RecommendedAction = $recommendedAction
+    }
+}
+
+function Show-Section {
+    param([string]$Title)
+
+    Write-Output ''
+    Write-Output ('=' * 72)
+    Write-Output $Title
+    Write-Output ('=' * 72)
+}
+
+# ---------------------------------------------------------------------------
+# Basic system information
+# ---------------------------------------------------------------------------
+
+$os = Get-CimInstance Win32_OperatingSystem
+$computerSystem = Get-CimInstance Win32_ComputerSystem
+
+$lastBoot = $os.LastBootUpTime
+$uptime = if ($lastBoot) {
+    (Get-Date) - $lastBoot
+}
+else {
+    $null
+}
+
+$script:CCMLogPath = Join-Path $env:windir 'CCM\Logs'
+
+# ---------------------------------------------------------------------------
+# ConfigMgr and registry reboot indicators
+# ---------------------------------------------------------------------------
+
+$configMgrState = Get-ConfigMgrRebootState
+
+$windowsUpdatePending = Test-RegistryPath `
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+
+$cbsPending = Test-RegistryPath `
+    'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending'
+
+$fileRenameData = Get-PendingFileRenameData
+
+$serverManagerValue = Get-ItemProperty `
+    -LiteralPath 'HKLM:\SOFTWARE\Microsoft\ServerManager' `
+    -Name CurrentRebootAttempts `
+    -ErrorAction SilentlyContinue
+
+$serverManagerPending = ($null -ne $serverManagerValue)
+
+# ---------------------------------------------------------------------------
+# ConfigMgr log patterns
+# ---------------------------------------------------------------------------
+
+$rebootPatterns = @(
+    'scheduled reboot',
+    'reboot pending',
+    'pending reboot',
+    'restart required',
+    'reboot required',
+    'notify reboot',
+    'deadline',
+    'initiating.*restart',
+    'initiating.*reboot',
+    'restart.*initiated',
+    'reboot.*initiated',
+    'shutdown',
+    'maintenance window',
+    'service window',
+    'outside.*window',
+    'no.*window',
+    'failed',
+    'error.*0x[0-9a-f]+'
+)
+
+$deploymentPatterns = @(
+    'pending reboot',
+    'reboot required',
+    'restart required',
+    'notify reboot',
+    'deadline',
+    'maintenance window',
+    'service window',
+    'non-business hours',
+    'no current service window',
+    'not enough.*time',
+    'insufficient.*time',
+    'failed',
+    'error.*0x[0-9a-f]+',
+    'assignment status',
+    'enforcement'
+)
+
+$handlerPatterns = @(
+    'finished installing',
+    'install.*complete',
+    'installation.*complete',
+    'reboot required',
+    'restart required',
+    'pending reboot',
+    'failed',
+    'error.*0x[0-9a-f]+',
+    '0x800f0831',
+    '0x80070070',
+    '0x80070057',
+    '0x800b0109',
+    '0x80244022',
+    '0x87d[0-9a-f]+'
+)
+
+$scanPatterns = @(
+    'scan.*complete',
+    'scan.*success',
+    'scan.*failed',
+    'scan.*error',
+    'failed',
+    'error.*0x[0-9a-f]+',
+    '0x800f0831',
+    '0x80070070',
+    '0x80070057',
+    '0x800b0109',
+    '0x80244022',
+    '0x87d[0-9a-f]+'
+)
+
+$windowPatterns = @(
+    'refreshing service windows',
+    'starttime',
+    'duration for the service window',
+    'service window',
+    'maintenance window',
+    'no current service window',
+    'not enough.*time',
+    'insufficient.*time'
+)
+
+$rebootMatches = Get-ConfigMgrLogMatches `
+    -LogName 'RebootCoordinator.log' `
+    -Patterns $rebootPatterns `
+    -TailLines $LogTailLines `
+    -MaximumMatches $MaximumLogMatches
+
+$deploymentMatches = Get-ConfigMgrLogMatches `
+    -LogName 'UpdatesDeployment.log' `
+    -Patterns $deploymentPatterns `
+    -TailLines $LogTailLines `
+    -MaximumMatches $MaximumLogMatches
+
+$handlerMatches = Get-ConfigMgrLogMatches `
+    -LogName 'UpdatesHandler.log' `
+    -Patterns $handlerPatterns `
+    -TailLines $LogTailLines `
+    -MaximumMatches $MaximumLogMatches
+
+$wuaMatches = Get-ConfigMgrLogMatches `
+    -LogName 'WUAHandler.log' `
+    -Patterns $handlerPatterns `
+    -TailLines $LogTailLines `
+    -MaximumMatches $MaximumLogMatches
+
+$scanMatches = Get-ConfigMgrLogMatches `
+    -LogName 'ScanAgent.log' `
+    -Patterns $scanPatterns `
+    -TailLines $LogTailLines `
+    -MaximumMatches $MaximumLogMatches
+
+$windowMatches = Get-ConfigMgrLogMatches `
+    -LogName 'ServiceWindowManager.log' `
+    -Patterns $windowPatterns `
+    -TailLines $LogTailLines `
+    -MaximumMatches $MaximumLogMatches
+
+# ---------------------------------------------------------------------------
+# Convert log evidence into Boolean findings
+# ---------------------------------------------------------------------------
+
+$allUpdateMessages = @(
+    $deploymentMatches.Message
+    $handlerMatches.Message
+    $wuaMatches.Message
+)
+
+$allRebootMessages = @($rebootMatches.Message)
+$allScanMessages = @($scanMatches.Message)
+$allWindowMessages = @($windowMatches.Message) + @($deploymentMatches.Message)
+
+$updateInstalledSuccessfully = $allUpdateMessages |
+    Where-Object {
+        $_ -match 'finished installing.*0x00000000' -or
+        $_ -match 'installation.*completed.*success' -or
+        $_ -match 'install.*successful'
+    } |
+    Select-Object -First 1
+
+
+$updateRequestedReboot = $allUpdateMessages |
+    Where-Object {
+        $_ -match 'reboot required.*yes' -or
+        $_ -match 'restart required' -or
+        $_ -match 'pending reboot'
+    } |
+    Select-Object -First 1
+
+
+$configMgrScheduledReboot = $allRebootMessages |
+    Where-Object {
+        $_ -match 'scheduled reboot' -or
+        $_ -match 'notify reboot'
+    } |
+    Select-Object -First 1
+
+
+$restartInitiatedFromLog = $allRebootMessages |
+    Where-Object {
+        $_ -match 'initiating.*restart' -or
+        $_ -match 'initiating.*reboot' -or
+        $_ -match 'restart.*initiated' -or
+        $_ -match 'reboot.*initiated' -or
+        $_ -match 'shutdown.*initiated'
+    } |
+    Select-Object -First 1
+
+
+$maintenanceWindowIssue = $allWindowMessages |
+    Where-Object {
+        $_ -match 'outside.*window' -or
+        $_ -match 'no current service window' -or
+        $_ -match 'not enough.*time' -or
+        $_ -match 'insufficient.*time' -or
+        $_ -match 'maintenance window.*expired'
+    } |
+    Select-Object -First 1
+
+
+$updateFailure = $allUpdateMessages |
+    Where-Object {
+        (
+            $_ -match 'failed' -or
+            $_ -match 'error.*0x[0-9a-f]+' -or
+            $_ -match '0x800f0831' -or
+            $_ -match '0x80070070' -or
+            $_ -match '0x80070057' -or
+            $_ -match '0x800b0109' -or
+            $_ -match '0x80244022' -or
+            $_ -match '0x87d[0-9a-f]+'
+        ) -and
+        $_ -notmatch '0x00000000'
+    } |
+    Select-Object -First 1
+
+
+$scanFailure = $allScanMessages |
+    Where-Object {
+        $_ -match 'scan.*failed' -or
+        $_ -match 'scan.*error' -or
+        $_ -match 'error.*0x[0-9a-f]+'
+    } |
+    Select-Object -First 1
+
+
+# ---------------------------------------------------------------------------
+# Windows reboot events
+# ---------------------------------------------------------------------------
+
+$rebootEvents = Get-RebootEvents -LookbackDays $EventLookbackDays
+
+$latestSuccessfulInstallText = Get-LatestSuccessfulInstallTime `
+    -WuaMatches $wuaMatches `
+    -HandlerMatches $handlerMatches
+
+# ConfigMgr dates can vary by locale. Use event comparison only when parsing works.
+$latestSuccessfulInstallDate = $null
+
+if ($latestSuccessfulInstallText) {
+    $parsedDate = :MinValue
+
+    if (:TryParse(
+        $latestSuccessfulInstallText,
+        [System.Globalization.CultureInfo]::CurrentCulture,
+        [System.Globalization.DateTimeStyles]::AllowWhiteSpaces,
+        [ref]$parsedDate
+    )) {
+        $latestSuccessfulInstallDate = $parsedDate
+    }
+}
+
+$restartAfterLatestInstall = $false
+
+if ($latestSuccessfulInstallDate) {
+    $restartAfterLatestInstall = $rebootEvents |
+        Where-Object {
+            $_.TimeCreated -gt $latestSuccessfulInstallDate -and
+            $_.EventID -in 1074, 6005, 6006, 6008, 41
+        } |
+        Select-Object -First 1
+    
+}
+elseif ($lastBoot -and $updateRequestedReboot) {
+    # The script cannot reliably correlate an unparsed ConfigMgr timestamp.
+    # Do not claim a post-install restart based only on uptime.
+    $restartAfterLatestInstall = $false
+}
+
+$restartInitiated = $restartInitiatedFromLog -or $rebootEvents |
+    Where-Object { $_.EventID -eq 1074 } |
+    Select-Object -First 1
+
+
+# ---------------------------------------------------------------------------
+# Recent update information
+# ---------------------------------------------------------------------------
+
+$recentHotfixes = @(
+    Get-HotFix |
+    Sort-Object InstalledOn -Descending |
+    Select-Object -First 15 HotFixID, Description, InstalledOn, InstalledBy
+)
+
+# ---------------------------------------------------------------------------
+# Create analysis object
+# ---------------------------------------------------------------------------
+
+$analysis = [PSCustomObject]@{
+    ComputerName = $env:COMPUTERNAME
+
+    System = [PSCustomObject]@{
+        Manufacturer   = $computerSystem.Manufacturer
+        Model          = $computerSystem.Model
+        OperatingSystem = $os.Caption
+        OSVersion      = $os.Version
+        LastBootTime   = $lastBoot
+        UptimeDays     = if ($uptime) {
+            :Round($uptime.TotalDays, 2)
+        }
+        else {
+            $null
+        }
+    }
+
+    ConfigMgr = $configMgrState
+
+    Registry = [PSCustomObject]@{
+        WindowsUpdateRebootRequired = $windowsUpdatePending
+        CBSRebootPending            = $cbsPending
+        PendingFileRenameOperations = $fileRenameData.Present
+        PendingFileRenameCount      = $fileRenameData.EntryCount
+        PendingFileRenameEntries    = $fileRenameData.Entries
+        ServerManagerRebootAttempts = $serverManagerPending
+    }
+
+    Evidence = [PSCustomObject]@{
+        UpdateInstalledSuccessfully = $updateInstalledSuccessfully
+        UpdateRequestedReboot       = $updateRequestedReboot
+        ConfigMgrScheduledReboot    = $configMgrScheduledReboot
+        RestartInitiated            = $restartInitiated
+        RestartAfterLatestInstall   = $restartAfterLatestInstall
+        MaintenanceWindowIssue      = $maintenanceWindowIssue
+        UpdateFailure               = $updateFailure
+        ScanFailure                 = $scanFailure
+        LatestInstallEvidence       = $latestSuccessfulInstallText
+    }
+
+    LogMatches = [PSCustomObject]@{
+        RebootCoordinator   = @($rebootMatches)
+        UpdatesDeployment   = @($deploymentMatches)
+        UpdatesHandler      = @($handlerMatches)
+        WUAHandler          = @($wuaMatches)
+        ScanAgent           = @($scanMatches)
+        ServiceWindowManager = @($windowMatches)
+    }
+
+    RebootEvents  = @($rebootEvents)
+    RecentHotfixes = @($recentHotfixes)
+}
+
+$analysis | Add-Member `
+    -MemberType NoteProperty `
+    -Name RootCause `
+    -Value (Get-RootCauseClassification -Data $analysis)
+
+# ---------------------------------------------------------------------------
+# JSON output, useful for ServiceNow or automation ingestion
+# ---------------------------------------------------------------------------
+
+if ($OutputJson) {
+    $analysis | ConvertTo-Json -Depth 8
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Console/SCCM output
+# ---------------------------------------------------------------------------
+
+Show-Section 'SYSTEM'
+
+Write-Output "Computer:             $($analysis.ComputerName)"
+Write-Output "Operating system:     $($analysis.System.OperatingSystem)"
+Write-Output "OS version:           $($analysis.System.OSVersion)"
+Write-Output "Last boot:            $($analysis.System.LastBootTime)"
+Write-Output "Uptime days:          $($analysis.System.UptimeDays)"
+Write-Output "ConfigMgr log path:   $CCMLogPath"
+
+Show-Section 'PENDING REBOOT INDICATORS'
+
+Write-Output "ConfigMgr query succeeded:       $($analysis.ConfigMgr.QuerySucceeded)"
+Write-Output "ConfigMgr reboot pending:        $($analysis.ConfigMgr.RebootPending)"
+Write-Output "ConfigMgr hard reboot pending:   $($analysis.ConfigMgr.IsHardRebootPending)"
+Write-Output "ConfigMgr grace period:          $($analysis.ConfigMgr.InGracePeriod)"
+Write-Output "ConfigMgr reboot deadline:       $($analysis.ConfigMgr.RebootDeadline)"
+Write-Output "Windows Update pending:          $($analysis.Registry.WindowsUpdateRebootRequired)"
+Write-Output "CBS servicing pending:           $($analysis.Registry.CBSRebootPending)"
+Write-Output "Pending file rename:             $($analysis.Registry.PendingFileRenameOperations)"
+Write-Output "Pending file rename entries:     $($analysis.Registry.PendingFileRenameCount)"
+Write-Output "Server Manager reboot attempts:  $($analysis.Registry.ServerManagerRebootAttempts)"
+
+if (-not $analysis.ConfigMgr.QuerySucceeded) {
+    Write-Output "ConfigMgr query error:            $($analysis.ConfigMgr.Error)"
+}
+
+Show-Section 'PATCH AND RESTART EVIDENCE'
+
+Write-Output "Successful install detected:     $($analysis.Evidence.UpdateInstalledSuccessfully)"
+Write-Output "Update requested reboot:         $($analysis.Evidence.UpdateRequestedReboot)"
+Write-Output "ConfigMgr scheduled reboot:      $($analysis.Evidence.ConfigMgrScheduledReboot)"
+Write-Output "Restart initiation detected:     $($analysis.Evidence.RestartInitiated)"
+Write-Output "Restart after latest install:    $($analysis.Evidence.RestartAfterLatestInstall)"
+Write-Output "Maintenance-window issue:        $($analysis.Evidence.MaintenanceWindowIssue)"
+Write-Output "Update failure detected:         $($analysis.Evidence.UpdateFailure)"
+Write-Output "Scan failure detected:           $($analysis.Evidence.ScanFailure)"
+Write-Output "Latest install evidence:         $($analysis.Evidence.LatestInstallEvidence)"
+
+Show-Section 'ROOT-CAUSE DETERMINATION'
+
+Write-Output "Classification:      $($analysis.RootCause.Classification)"
+Write-Output "Confidence:          $($analysis.RootCause.Confidence)"
+Write-Output ''
+Write-Output 'Evidence:'
+
+if ($analysis.RootCause.Reasons.Count -eq 0) {
+    Write-Output ' - No active pending-reboot indicators were detected.'
+}
+else {
+    foreach ($reason in $analysis.RootCause.Reasons) {
+        Write-Output " - $reason"
+    }
+}
+
+Write-Output ''
+Write-Output "Recommended action:  $($analysis.RootCause.RecommendedAction)"
+
+Show-Section 'RECENT RESTART EVENTS'
+
+if ($analysis.RebootEvents.Count -eq 0) {
+    Write-Output "No matching restart events found in the last $EventLookbackDays days."
+}
+else {
+    $analysis.RebootEvents |
+        Select-Object -First 15 TimeCreated, EventID, Meaning |
+        Format-Table -AutoSize |
+        Out-String |
+        Write-Output
+}
+
+Show-Section 'RECENT HOTFIXES'
+
+if ($analysis.RecentHotfixes.Count -eq 0) {
+    Write-Output 'No recent hotfix results returned by Get-HotFix.'
+}
+else {
+    $analysis.RecentHotfixes |
+        Format-Table HotFixID, InstalledOn, Description -AutoSize |
+        Out-String |
+        Write-Output
+}
+
+if ($analysis.Registry.PendingFileRenameOperations) {
+    Show-Section 'PENDING FILE RENAME OPERATIONS'
+
+    $analysis.Registry.PendingFileRenameEntries |
+        Select-Object -First 30 |
+        ForEach-Object {
+            Write-Output " - $_"
+        }
+}
+
+if ($IncludeDetailedLogMatches) {
+    Show-Section 'DETAILED CONFIGMGR LOG MATCHES'
+
+    foreach ($property in $analysis.LogMatches.PSObject.Properties) {
+        Write-Output ''
+        Write-Output "--- $($property.Name) ---"
+
+        $entries = @($property.Value)
+
+        if ($entries.Count -eq 0) {
+            Write-Output 'No matching entries found.'
+            continue
+        }
+
+        foreach ($entry in $entries) {
+            Write-Output "[$($entry.Date) $($entry.Time)] $($entry.Message)"
+        }
+    }
+}
+
+Show-Section 'COMPACT RESULT'
+
+[PSCustomObject]@{
+    ComputerName       = $analysis.ComputerName
+    PendingReboot      = $analysis.ConfigMgr.RebootPending
+    HardRebootPending  = $analysis.ConfigMgr.IsHardRebootPending
+    WindowsUpdate      = $analysis.Registry.WindowsUpdateRebootRequired
+    CBS                = $analysis.Registry.CBSRebootPending
+    FileRename         = $analysis.Registry.PendingFileRenameOperations
+    LastBootTime       = $analysis.System.LastBootTime
+    RootCause          = $analysis.RootCause.Classification
+    Confidence         = $analysis.RootCause.Confidence
+    RecommendedAction  = $analysis.RootCause.RecommendedAction
+} | Format-List | Out-String | Write-Output
+
+# Useful exit codes for automation:
+# 0 = No pending reboot
+# 1 = Pending reboot found
+# 2 = ConfigMgr query failed, but another pending indicator was found
+# 3 = ConfigMgr query failed and no pending indicator was found
+
+$anyPending = @(
+    $analysis.ConfigMgr.RebootPending
+    $analysis.ConfigMgr.IsHardRebootPending
+    $analysis.Registry.WindowsUpdateRebootRequired
+    $analysis.Registry.CBSRebootPending
+    $analysis.Registry.PendingFileRenameOperations
+    $analysis.Registry.ServerManagerRebootAttempts
+) -contains $true
+
+if (-not $analysis.ConfigMgr.QuerySucceeded -and $anyPending) {
+    exit 2
+}
+elseif (-not $analysis.ConfigMgr.QuerySucceeded) {
+    exit 3
+}
+elseif ($anyPending) {
+    exit 1
+}
+else {
+    exit 0
+}
